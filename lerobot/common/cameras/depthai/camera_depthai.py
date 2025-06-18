@@ -121,7 +121,10 @@ class DepthAICamera(Camera):
         else:
             self.mxid = self._find_mxid_from_name(config.mxid_or_name)
 
-        self.fps = config.fps
+        # Set defaults and extract configuration
+        self.fps = config.fps or 30
+        self.width = config.width or 640
+        self.height = config.height or 480
         self.color_mode = config.color_mode
         self.use_depth = config.use_depth
         self.warmup_s = config.warmup_s
@@ -139,103 +142,63 @@ class DepthAICamera(Camera):
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
 
-        if self.height and self.width:
-            self.capture_width, self.capture_height = self.width, self.height
-            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-                self.capture_width, self.capture_height = self.height, self.width
+        # Calculate capture dimensions considering rotation
+        self.capture_width, self.capture_height = self.width, self.height
+        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
+            self.capture_width, self.capture_height = self.height, self.width
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__}({self.mxid})"
 
     @property
     def is_connected(self) -> bool:
-        """Checks if the camera device is connected and pipeline is running."""
-        return self.device is not None and self.pipeline is not None
+        """Checks if the camera device is connected."""
+        return self.device is not None
 
     def connect(self, warmup: bool = True):
         """
-        Connects to the DepthAI camera specified in the configuration.
+        Connects to the DepthAI camera and starts the pipeline.
 
-        Initializes the DepthAI device, creates and configures the pipeline with required 
-        streams (color and optionally depth), starts the pipeline, and validates the 
-        actual stream settings.
+        Args:
+            warmup: Whether to warm up the camera by reading a few frames.
 
         Raises:
             DeviceAlreadyConnectedError: If the camera is already connected.
-            ValueError: If the configuration is invalid (e.g., missing mxid/name, name not unique).
-            ConnectionError: If the camera is found but fails to start the pipeline or no DepthAI devices are detected at all.
-            RuntimeError: If the pipeline starts but fails to apply requested settings.
+            ConnectionError: If the camera fails to connect or start.
         """
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} is already connected.")
 
         try:
-            # Create pipeline
-            self.pipeline = dai.Pipeline()
+            # Connect to specific device and create pipeline
+            self.device = dai.Device(self.mxid)
+            self.pipeline = dai.Pipeline(self.device)
             
-            # Create color camera node
-            cam_rgb = self.pipeline.create(dai.node.ColorCamera)
-            cam_rgb.setPreviewSize(self.capture_width or 640, self.capture_height or 480)
-            cam_rgb.setInterleaved(False)
-            cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
+            # Create and configure camera node
+            cam = self.pipeline.create(dai.node.Camera).build()
+            self.color_queue = cam.requestOutput((self.capture_width, self.capture_height)).createOutputQueue()
             
-            if self.fps:
-                cam_rgb.setFps(self.fps)
-
-            # Create output queue for color
-            color_out = self.pipeline.create(dai.node.XLinkOut)
-            color_out.setStreamName("color")
-            cam_rgb.preview.link(color_out.input)
-
-            # Create depth camera if requested
-            if self.use_depth:
-                # Create mono cameras for depth
-                mono_left = self.pipeline.create(dai.node.MonoCamera)
-                mono_right = self.pipeline.create(dai.node.MonoCamera)
-                depth = self.pipeline.create(dai.node.StereoDepth)
-
-                mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
-                mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
-                mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
-                mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
-
-                # Create depth output
-                depth.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
-                depth.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
-                depth.setLeftRightCheck(True)
-                depth.setSubpixel(False)
-
-                mono_left.out.link(depth.left)
-                mono_right.out.link(depth.right)
-
-                depth_out = self.pipeline.create(dai.node.XLinkOut)
-                depth_out.setStreamName("depth")
-                depth.depth.link(depth_out.input)
-
-            # Connect to device
-            device_info = dai.DeviceInfo(self.mxid)
-            self.device = dai.Device(self.pipeline, device_info)
-
-            # Get output queues
-            self.color_queue = self.device.getOutputQueue(name="color", maxSize=4, blocking=False)
-            if self.use_depth:
-                self.depth_queue = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
+            # Start pipeline
+            self.pipeline.start()
 
         except Exception as e:
             self.device = None
             self.pipeline = None
+            self.color_queue = None
+            self.depth_queue = None
             raise ConnectionError(
-                f"Failed to open {self}. "
-                "Run `python -m lerobot.find_cameras depthai` to find available cameras."
+                f"Failed to open {self}. Error: {str(e)}"
             ) from e
-
-        self._configure_capture_settings()
 
         if warmup:
             time.sleep(1)  # DepthAI cameras need time to warm up
             start_time = time.time()
             while time.time() - start_time < self.warmup_s:
-                self.read()
+                try:
+                    self.read()
+                except Exception:
+                    # Ignore warmup failures
+                    pass
                 time.sleep(0.1)
 
         logger.info(f"{self} connected.")
@@ -243,32 +206,28 @@ class DepthAICamera(Camera):
     @staticmethod
     def find_cameras() -> List[Dict[str, Any]]:
         """
-        Detects available Luxonis DepthAI cameras connected to the system.
+        Detects available DepthAI cameras connected to the system.
 
         Returns:
-            List[Dict[str, Any]]: A list of dictionaries,
-            where each dictionary contains 'type', 'id' (MxID), 'name',
-            and other available specs, and the default profile properties (width, height, fps).
-
-        Raises:
-            OSError: If depthai is not installed.
-            ImportError: If depthai is not installed.
+            List of camera info dictionaries with id, name, type, and default profile.
         """
         found_cameras_info = []
         
         try:
-            devices = dai.Device.getAllAvailableDevices()
+            # Use the correct DepthAI v3 API for device discovery
+            devices = dai.DeviceBase.getAllAvailableDevices()
             
             for device_info in devices:
+                # In DepthAI v3, device info attributes are direct properties
                 camera_info = {
-                    "name": device_info.desc.name,
+                    "name": getattr(device_info, 'name', 'Unknown DepthAI Camera'),
                     "type": "DepthAI",
-                    "id": device_info.getMxId(),
-                    "state": device_info.state.name,
-                    "protocol": device_info.desc.protocol.name,
-                    "platform": device_info.desc.platform.name,
-                    "product_name": device_info.desc.productName,
-                    "board_name": device_info.desc.boardName,
+                    "id": device_info.deviceId,  # Use deviceId instead of getMxId()
+                    "state": getattr(device_info, 'state', 'Unknown').name if hasattr(getattr(device_info, 'state', None), 'name') else str(getattr(device_info, 'state', 'Unknown')),
+                    "protocol": getattr(device_info, 'protocol', 'Unknown').name if hasattr(getattr(device_info, 'protocol', None), 'name') else str(getattr(device_info, 'protocol', 'Unknown')),
+                    "platform": getattr(device_info, 'platform', 'Unknown').name if hasattr(getattr(device_info, 'platform', None), 'name') else str(getattr(device_info, 'platform', 'Unknown')),
+                    "product_name": getattr(device_info, 'productName', 'Unknown'),
+                    "board_name": getattr(device_info, 'boardName', 'Unknown'),
                     "default_stream_profile": {
                         "format": "RGB888",
                         "width": 640,
@@ -304,108 +263,48 @@ class DepthAICamera(Camera):
         mxid = str(found_devices[0]["id"])
         return mxid
 
-    def _configure_capture_settings(self) -> None:
-        """Sets fps, width, and height from device stream if not already configured.
-
-        Uses default values if not specified in config. Handles rotation by
-        swapping width/height when needed. Original capture dimensions are always stored.
-
-        Raises:
-            DeviceNotConnectedError: If device is not connected.
-        """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"Cannot validate settings for {self} as it is not connected.")
-
-        if self.fps is None:
-            self.fps = 30  # Default FPS for DepthAI
-
-        if self.width is None or self.height is None:
-            actual_width = 640  # Default width
-            actual_height = 480  # Default height
-            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-                self.width, self.height = actual_height, actual_width
-                self.capture_width, self.capture_height = actual_width, actual_height
-            else:
-                self.width, self.height = actual_width, actual_height
-                self.capture_width, self.capture_height = actual_width, actual_height
-
     def read_depth(self, timeout_ms: int = 200) -> np.ndarray:
         """
         Reads a single frame (depth) synchronously from the camera.
 
-        This is a blocking call. It waits for a coherent depth frame
-        from the camera hardware via the DepthAI pipeline.
-
-        Args:
-            timeout_ms (int): Maximum time in milliseconds to wait for a frame. Defaults to 200ms.
-
-        Returns:
-            np.ndarray: The depth map as a NumPy array (height, width)
-                  of type `np.uint16` (raw depth values in millimeters) and rotation.
+        Note: Depth functionality is not yet implemented in this DepthAI v3 integration.
 
         Raises:
-            DeviceNotConnectedError: If the camera is not connected.
-            RuntimeError: If reading frames from the pipeline fails or frames are invalid.
+            NotImplementedError: Depth reading is not yet implemented.
         """
-
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-        if not self.use_depth:
-            raise RuntimeError(
-                f"Failed to capture depth frame '.read_depth()'. Depth stream is not enabled for {self}."
-            )
-
-        start_time = time.perf_counter()
-
-        try:
-            in_depth = self.depth_queue.get()
-            depth_frame = in_depth.getFrame()
-            
-            depth_map_processed = self._postprocess_image(depth_frame, depth_frame=True)
-
-            read_duration_ms = (time.perf_counter() - start_time) * 1e3
-            logger.debug(f"{self} read_depth took: {read_duration_ms:.1f}ms")
-
-            return depth_map_processed
-            
-        except Exception as e:
-            raise RuntimeError(f"{self} read_depth failed: {e}")
+        raise NotImplementedError("Depth reading is not yet implemented for DepthAI v3 integration.")
 
     def read(self, color_mode: ColorMode | None = None, timeout_ms: int = 200) -> np.ndarray:
         """
         Reads a single frame (color) synchronously from the camera.
 
-        This is a blocking call. It waits for a coherent color frame
-        from the camera hardware via the DepthAI pipeline.
-
         Args:
-            timeout_ms (int): Maximum time in milliseconds to wait for a frame. Defaults to 200ms.
+            color_mode: The color mode (RGB or BGR). If None, uses the default from config.
+            timeout_ms: Maximum time in milliseconds to wait for a frame (unused in current implementation).
 
         Returns:
-            np.ndarray: The captured color frame as a NumPy array
-              (height, width, channels), processed according to `color_mode` and rotation.
+            np.ndarray: The captured color frame as a NumPy array (height, width, channels).
 
         Raises:
             DeviceNotConnectedError: If the camera is not connected.
-            RuntimeError: If reading frames from the pipeline fails or frames are invalid.
-            ValueError: If an invalid `color_mode` is requested.
+            RuntimeError: If reading frames from the pipeline fails.
         """
-
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        start_time = time.perf_counter()
-
         try:
-            in_rgb = self.color_queue.get()
-            color_frame = in_rgb.getCvFrame()
+            # Get frame from color queue
+            frame_data = self.color_queue.get()
+            if frame_data is None:
+                raise RuntimeError("No frame available from camera")
+                
+            # Get OpenCV frame (BGR format by default)
+            color_frame = frame_data.getCvFrame()
+            if color_frame is None or color_frame.size == 0:
+                raise RuntimeError("Received empty frame")
             
-            color_image_processed = self._postprocess_image(color_frame, color_mode)
-
-            read_duration_ms = (time.perf_counter() - start_time) * 1e3
-            logger.debug(f"{self} read took: {read_duration_ms:.1f}ms")
-
-            return color_image_processed
+            # Process the frame (handle color conversion and rotation)
+            return self._postprocess_image(color_frame, color_mode)
             
         except Exception as e:
             raise RuntimeError(f"{self} read failed: {e}")
@@ -414,51 +313,29 @@ class DepthAICamera(Camera):
         self, image: np.ndarray, color_mode: ColorMode | None = None, depth_frame: bool = False
     ) -> np.ndarray:
         """
-        Applies color conversion, dimension validation, and rotation to a raw color frame.
+        Applies color conversion and rotation to a raw frame.
 
         Args:
-            image (np.ndarray): The raw image frame (expected RGB format from DepthAI).
-            color_mode (Optional[ColorMode]): The target color mode (RGB or BGR). If None,
-                                             uses the instance's default `self.color_mode`.
+            image: The raw image frame (BGR format from DepthAI v3).
+            color_mode: The target color mode (RGB or BGR). If None, uses instance default.
+            depth_frame: Whether this is a depth frame (unused, for future compatibility).
 
         Returns:
-            np.ndarray: The processed image frame according to `self.color_mode` and `self.rotation`.
-
-        Raises:
-            ValueError: If the requested `color_mode` is invalid.
-            RuntimeError: If the raw frame dimensions do not match the configured
-                          `width` and `height`.
+            np.ndarray: The processed image frame.
         """
+        # Handle color conversion for color frames
+        if not depth_frame:
+            target_mode = color_mode or self.color_mode
+            if target_mode == ColorMode.RGB:
+                # Convert from BGR (DepthAI default) to RGB
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # For BGR mode, keep as-is since DepthAI provides BGR
 
-        if color_mode and color_mode not in (ColorMode.RGB, ColorMode.BGR):
-            raise ValueError(
-                f"Invalid requested color mode '{color_mode}'. Expected {ColorMode.RGB} or {ColorMode.BGR}."
-            )
+        # Apply rotation if needed
+        if self.rotation and self.rotation != 0:
+            image = cv2.rotate(image, self.rotation)
 
-        if depth_frame:
-            h, w = image.shape
-        else:
-            h, w, c = image.shape
-
-            if c != 3:
-                raise RuntimeError(f"{self} frame channels={c} do not match expected 3 channels (RGB/BGR).")
-
-        if h != self.capture_height or w != self.capture_width:
-            raise RuntimeError(
-                f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
-            )
-
-        processed_image = image
-        
-        # DepthAI provides RGB by default, convert to BGR if needed
-        requested_color_mode = self.color_mode if color_mode is None else color_mode
-        if not depth_frame and requested_color_mode == ColorMode.BGR:
-            processed_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-            processed_image = cv2.rotate(processed_image, self.rotation)
-
-        return processed_image
+        return image
 
     def _read_loop(self):
         """
