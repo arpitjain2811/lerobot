@@ -23,7 +23,7 @@ on:
 
   # Runs at 02:00
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 2 29 02 *"
 
 # Sets up the environment variables
 env:
